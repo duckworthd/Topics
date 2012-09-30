@@ -9,7 +9,7 @@ from sklearn.datasets import fetch_20newsgroups
 
 from topics.lda import VariationalLDA
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 # retrieve articles
 categories = [

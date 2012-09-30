@@ -8,7 +8,7 @@ from numbers import Number
 
 import numpy as np
 from scipy import linalg
-from scipy.special import psi as digamma
+from scipy.special import psi as digamma, gammaln
 from scipy.misc import logsumexp
 
 
@@ -80,8 +80,7 @@ class GibbsLDA(object):
     # resample word topics
     history = []  # state of chain after each sweep
     for sweep in range(n_sweeps):
-      #self.logger.debug('starting sweep #%d' % (sweep,))
-      print('starting sweep #%d' % (sweep,))
+      self.logger.debug('starting sweep #%d' % (sweep,))
       for (d, doc) in enumerate(documents):
 
         if d % 100 == 0:
@@ -160,8 +159,7 @@ class GibbsLDA(object):
 
     word_index = dict( (word, index) for (index, word) in enumerate(sorted(words)) )
 
-    #self.logger.debug('n_topics = %d, n_words = %d, n_docs = %d' % (n_topics, n_words, n_docs))
-    print('n_topics = %d, n_words = %d, n_docs = %d' % (n_topics, n_words, n_docs))
+    self.logger.debug('n_topics = %d, n_words = %d, n_docs = %d' % (n_topics, n_words, n_docs))
 
     return (doc_topic_prior, topic_word_prior, word_index)
 
@@ -194,10 +192,18 @@ class VariationalLDA(object):
     doc_word_topic_params = r.rand(n_docs, n_words, n_topics)
     while True:
       old_topic_word_params = np.copy(topic_word_params)
+      self.logger.info("Starting new pass")
 
       for d in range(n_docs):
         if d % 100 == 0:
-          print "Processing document %d/%d" % (d, n_docs)
+          self.logger.info("Processing document %d/%d" % (d, n_docs))
+          try:
+            ll = self.elbo(doc_word_counts, doc_word_topic_params,
+                doc_topic_params, topic_word_params, doc_topic_prior,
+                topic_word_prior)
+            self.logger.info("Current Log Likelihood: %f" % (ll,))
+          except AssertionError as e:
+            logging.warn('Failed to calculate ELBO: %s' % (str(e),))
 
         # reset doc-topic parameters for this documents
         doc_topic_params[d] = np.ones(n_topics)
@@ -219,20 +225,22 @@ class VariationalLDA(object):
           for t in range(n_topics):
             doc_topic_params[d,t] += np.dot(doc_word_topic_params[d,:,t], doc_word_counts[d,:])
 
+
           # quit if converged
           err = linalg.norm(old_doc_topic_params - doc_topic_params[d], 1) / n_topics
           if err  < 1e-5:
-            self.logger.debug('doc-topic difference: %f' % (err,))
-            self.logger.debug('Sweet escape!')
+            #self.logger.debug('doc-topic difference: %f' % (err,))
+            #self.logger.debug('Sweet escape!')
             break
           else:
-            self.logger.debug('doc-topic difference: %f' % (err,))
+            #self.logger.debug('doc-topic difference: %f' % (err,))
+            pass
 
       # update q(word | topic)
       for t in range(n_topics):
         topic_word_params[t] = topic_word_prior
         for w in range(n_words):
-          topic_word_params[t,w] = np.dot(doc_word_topic_params[:,w,t], doc_word_counts[:,w])
+          topic_word_params[t,w] += np.dot(doc_word_topic_params[:,w,t], doc_word_counts[:,w])
 
       # quit if converged
       err = linalg.norm(old_topic_word_params - topic_word_params) / (n_topics * n_words)
@@ -288,19 +296,55 @@ class VariationalLDA(object):
 
     return (doc_word_counts, doc_topic_prior, topic_word_prior, word_index)
 
+  def elbo(self, doc_word_counts, doc_word_topic_params, doc_topic_params,
+      topic_word_params, doc_topic_prior, topic_word_prior):
+    """Calculate expected lower bound of the variational approximation
 
-class SpectralLDA(object):
-  """Latent Dirichlet Allocation with Spectral Learning
+    This should increase with each step in inference
+    """
+    n_docs = doc_word_counts.shape[0]
+    n_words = doc_word_counts.shape[1]
+    n_topics = topic_word_params.shape[0]
 
-  Implements "Excess Correlation Analysis" (Anandkumar, 2012) wherein
-  parameters are learned using Linear Algebra techniques.
-  """
-  def __init__(self):
-    pass
+    assert np.all(doc_topic_params > 0), 'Invalid doc-topic parameters!'
+    assert np.all(topic_word_params > 0), 'Invalid topic-word parameters!'
 
-  def infer(self, documents):
-    pass
+    # compute expectations
+    E_doc_topic = np.zeros( (n_docs, n_topics) )
+    for (d,t) in itertools.product(range(n_docs), range(n_topics)):
+      E_doc_topic[d,t] = digamma(doc_topic_params[d,t]) - digamma(np.sum(doc_topic_params[d,:]))
 
+    E_topic_word = np.zeros( (n_topics, n_words) )
+    for (t,w) in itertools.product(range(n_topics), range(n_words)):
+      E_topic_word[t,w] = digamma(topic_word_params[t,w]) - digamma(np.sum(topic_word_params[t,:]))
+
+    # compile result
+    result = 0.0
+    for d in range(n_docs):
+      for w in np.nonzero(doc_word_counts[d])[0]:
+        for t in range(n_topics):
+          result += default_on_nan(
+              doc_word_counts[d,w] * doc_word_topic_params[d,w,t] * (
+                E_doc_topic[d,t] + E_topic_word[t,w] - np.log(doc_word_topic_params[d,w,t])
+              ),
+              0.0
+          )
+      result -= gammaln(np.sum(doc_topic_params[d,:]))
+      for t in range(n_topics):
+        result += (doc_topic_prior[t] - doc_topic_params[d,t]) * E_doc_topic[d,t] + gammaln(doc_topic_params[d,t])
+    for t in range(n_topics):
+      result -= gammaln(np.sum(topic_word_params[t,:]))
+      for w in range(n_words):
+        result += (topic_word_prior[w] - topic_word_params[t,w]) * E_topic_word[t,w] + gammaln(topic_word_params[t,w])
+    result += n_docs * gammaln(np.sum(doc_topic_prior))
+    for t in range(n_topics):
+      result -= n_docs * gammaln(doc_topic_prior[t])
+    result += gammaln(np.sum(topic_word_prior))
+    for w in range(n_words):
+      result -= gammaln(topic_word_prior[w])
+
+    # done
+    return result
 
 
 def reindex(documents):
@@ -316,3 +360,9 @@ def reindex(documents):
     documents2.append(doc_words)
   return (documents2, word_index)
 
+
+def default_on_nan(f, default):
+  if np.isnan(f):
+    return default
+  else:
+    return f
