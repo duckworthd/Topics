@@ -7,14 +7,18 @@ import logging
 from numbers import Number
 
 import numpy as np
+from scipy import linalg
+from scipy.special import psi as digamma
+from scipy.misc import logsumexp
 
 
 class GibbsLDA(object):
   """Latent Dirichlet Allocation with Gibbs Sampling for Inference
 
-  Implements "Collapsed Gibbs Sampling" wherein doc-topic and topic-word
-  distributions are integrated away implicitly. The only variables iterated
-  over during MCMC are the individual topics of each word.
+  Implements "Collapsed Gibbs Sampling" (Griffiths & Steyvers, 2004) wherein
+  doc-topic and topic-word distributions are integrated away implicitly. The
+  only variables iterated over during MCMC are the individual topics of each
+  word.
 
   Parameters
   ----------
@@ -163,8 +167,152 @@ class GibbsLDA(object):
 
 
 class VariationalLDA(object):
+  """Latent Dirichlet Allocation with Variational Inference
+
+  Implements batch Variational Inference algorithm described in the original
+  Latent Dirichlet Allocation (Blei, 2003) where posterior is approximated by
+  the product of q(topic | word index, doc) [categorical], q(topic | doc)
+  [dirichlet], and q(word | topic) [dirichlet].
+  """
+  def __init__(self, doc_topic_prior=0.01, topic_word_prior=0.01, n_topics=None):
+    self.doc_topic_prior = doc_topic_prior
+    self.topic_word_prior = topic_word_prior
+    self.n_topics = n_topics
+    self.logger = logging.getLogger(str(self.__class__))
+
+  def infer(self, documents):
+    # initialize priors, documents
+    (doc_word_counts, doc_topic_prior, topic_word_prior, word_index) = self._initialize(documents)
+    n_docs = doc_word_counts.shape[0]
+    n_topics = doc_topic_prior.shape[0]
+    n_words = doc_word_counts.shape[1]
+
+    # initialize parameters
+    r = np.random.RandomState(0)
+    doc_topic_params = r.rand(n_docs, n_topics)
+    topic_word_params = r.rand(n_topics, n_words)
+    doc_word_topic_params = r.rand(n_docs, n_words, n_topics)
+    while True:
+      old_topic_word_params = np.copy(topic_word_params)
+
+      for d in range(n_docs):
+        if d % 100 == 0:
+          print "Processing document %d/%d" % (d, n_docs)
+
+        # reset doc-topic parameters for this documents
+        doc_topic_params[d] = np.ones(n_topics)
+        while True:
+          old_doc_topic_params = np.copy(doc_topic_params[d])
+
+          # update q(topic | document, word)
+          for w in np.nonzero(doc_word_counts[d])[0]:
+            log_dwt = np.zeros(n_topics)  # do the following doc_word_topic_param update in logspace
+            for t in range(n_topics):
+              log_dwt[t] = (
+                digamma(doc_topic_params[d,t]) - digamma(np.sum(doc_topic_params[d]))
+                + digamma(topic_word_params[t,w]) - digamma(np.sum(topic_word_params[t]))
+              )
+            doc_word_topic_params[d,w] = np.exp(log_dwt - logsumexp(log_dwt))
+
+          # update q(topic | doc)
+          doc_topic_params[d] = doc_topic_prior
+          for t in range(n_topics):
+            doc_topic_params[d,t] += np.dot(doc_word_topic_params[d,:,t], doc_word_counts[d,:])
+
+          # quit if converged
+          err = linalg.norm(old_doc_topic_params - doc_topic_params[d], 1) / n_topics
+          if err  < 1e-5:
+            self.logger.debug('doc-topic difference: %f' % (err,))
+            self.logger.debug('Sweet escape!')
+            break
+          else:
+            self.logger.debug('doc-topic difference: %f' % (err,))
+
+      # update q(word | topic)
+      for t in range(n_topics):
+        topic_word_params[t] = topic_word_prior
+        for w in range(n_words):
+          topic_word_params[t,w] = np.dot(doc_word_topic_params[:,w,t], doc_word_counts[:,w])
+
+      # quit if converged
+      err = linalg.norm(old_topic_word_params - topic_word_params) / (n_topics * n_words)
+      if err  < 1e-5:
+        print 'topic-word difference: %f' % (err,)
+        print 'Finally done!'
+        break
+      else:
+        print 'topic-word difference: %f' % (err,)
+
+    return {
+        'doc_topic': doc_topic_params,
+        'topic_word': topic_word_params,
+        'doc_word_topic': doc_word_topic_params,
+        'word_index': word_index
+    }
+
+  def _initialize(self, documents):
+    # change words into indices
+    (documents, word_index) = reindex(documents)
+
+    # figure out number of topics
+    n_topics = (
+        self.n_topics
+        if self.n_topics is not None
+        else len(self.doc_topic_prior)
+    )
+    n_words = len(word_index)
+    n_docs = len(documents)
+
+    # build a doc-word count matrix
+    doc_word_counts = np.zeros( (n_docs, n_words) )
+    for (d, doc) in enumerate(documents):
+      for (i, word) in enumerate(doc):
+        doc_word_counts[d,word] += 1
+
+    # build doc-topic and topic-word priors
+    if isinstance(self.doc_topic_prior, Number):
+      concentration = self.doc_topic_prior
+      base = np.ones(n_topics) / n_topics
+    else:
+      concentration = 1.0
+      base = self.doc_topic_prior
+    doc_topic_prior = concentration * base
+
+    if isinstance(self.topic_word_prior, Number):
+      concentration = self.topic_word_prior
+      base = np.ones(n_words) / n_words
+    else:
+      concentration = 1.0
+      base = self.topic_word_prior
+    topic_word_prior = concentration * base
+
+    return (doc_word_counts, doc_topic_prior, topic_word_prior, word_index)
+
+
+class SpectralLDA(object):
+  """Latent Dirichlet Allocation with Spectral Learning
+
+  Implements "Excess Correlation Analysis" (Anandkumar, 2012) wherein
+  parameters are learned using Linear Algebra techniques.
+  """
   def __init__(self):
     pass
 
-  def infer(self, words):
+  def infer(self, documents):
     pass
+
+
+
+def reindex(documents):
+  """Replace each word in a document with an integer index"""
+  words = set(itertools.chain(*documents))
+  word_index = dict( (word, i) for (i, word) in enumerate(sorted(words)) )
+
+  documents2 = []
+  for (d, doc) in enumerate(documents):
+    doc_words = []
+    for (i, word) in enumerate(doc):
+      doc_words.append(word_index[word])
+    documents2.append(doc_words)
+  return (documents2, word_index)
+
