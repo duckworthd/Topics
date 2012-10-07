@@ -11,6 +11,8 @@ from scipy import linalg
 from scipy.special import psi as digamma, gammaln
 from scipy.misc import logsumexp
 
+from util import reindex, flatten_counts, default_on_nan
+
 
 class GibbsLDA(object):
   """Latent Dirichlet Allocation with Gibbs Sampling for Inference
@@ -345,24 +347,3 @@ class VariationalLDA(object):
 
     # done
     return result
-
-
-def reindex(documents):
-  """Replace each word in a document with an integer index"""
-  words = set(itertools.chain(*documents))
-  word_index = dict( (word, i) for (i, word) in enumerate(sorted(words)) )
-
-  documents2 = []
-  for (d, doc) in enumerate(documents):
-    doc_words = []
-    for (i, word) in enumerate(doc):
-      doc_words.append(word_index[word])
-    documents2.append(doc_words)
-  return (documents2, word_index)
-
-
-def default_on_nan(f, default):
-  if np.isnan(f):
-    return default
-  else:
-    return f
