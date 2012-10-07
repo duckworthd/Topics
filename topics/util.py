@@ -45,3 +45,10 @@ def doc_word_matrix(documents, n_words):
   rows, cols, vals = zip(*coordinates)
   M = sp.coo_matrix((vals, (rows, cols)), dtype=float)
   return M.tocsr()
+
+
+def default_on_nan(f, default):
+  if np.isnan(f):
+    return default
+  else:
+    return f
