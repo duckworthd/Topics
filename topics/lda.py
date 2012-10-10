@@ -7,7 +7,8 @@ import logging
 from numbers import Number
 
 import numpy as np
-from scipy import linalg
+from scipy import linalg, sparse, weave
+from scipy.weave import converters
 
 from util import categorical, flatten_counts, reindex
 
@@ -273,7 +274,10 @@ class SpectralLDA(object):
     # 1. Calculate moments (defer third till later)
     self.logger.debug("Constructing 1st and 2nd moments")
     m1 = self.moment1(n_words, documents)
-    m2 = self.moment2(n_words, documents)
+    #m2 = self.moment2(n_words, documents)
+
+    docs = np.array(map(np.array, documents))
+    m2 = self.moment2_vectorized(n_words, docs)
 
     # 2. Whiten
     self.logger.debug("Doing first SVD")
@@ -296,11 +300,11 @@ class SpectralLDA(object):
     self.logger.debug("Starting power iterations")
     V = r.randn(n_topics, n_topics)  # initialize an orthonormal basis
     V = linalg.orth(V)
-    for iteration in range(n_iter):
+    for iteration in range(4):
       self.logger.debug("iteration %d" % (iteration,))
       for t in range(n_topics):
         Wv = W.dot(V[:,t])
-        triples = self.triples(n_words, documents, Wv, m1=m1, m2=m2)
+        triples = self.triples(n_words, documents, docs, Wv, m1=m1, m2=m2)
         V[:,t] = W.T.dot(triples).dot(Wv)
       V = linalg.orth(V)
 
@@ -334,10 +338,36 @@ class SpectralLDA(object):
       total = 0
       for i in range(len(doc)):
         for j in range(len(doc)):
+          if i == j: continue
           m2doc[doc[i], doc[j]] += 1.0
           total += 1
       m2 += m2doc / total
     m2 /= len(documents)
+    return m2
+
+  def moment2_vectorized(self, n_words, docs):
+    m2 = np.zeros( (n_words, n_words) )   # average covariance over all docs
+    nd = docs.shape[0]
+    ns = np.array([x.shape[0] for x in docs])
+    code = """
+for (int i = 0; i < nd; ++i) {
+  int len = ns(i);
+  double div = len*(len - 1);
+  double count = 1.0/(div * nd);
+  for (int j = 0; j < len; ++j) {
+    for (int k = j+1; k < len; ++k) {
+      int idxj = docs(i,j);
+      int idxk = docs(i,k);
+      m2(idxk,idxj) += count;
+      m2(idxj,idxk) += count;
+    }
+  }
+}
+    """
+    weave.inline(code,
+                 ["m2", "nd", "ns", "docs"],
+                 type_converters=converters.blitz,
+                 compiler="gcc")
     return m2
 
   def moment3(self, n_words, documents, axis):
@@ -348,10 +378,43 @@ class SpectralLDA(object):
       for i in range(len(doc)):
         for j in range(len(doc)):
           for k in range(len(doc)):
+            if len(set([i, j, k])) != 3: continue
             m3doc[doc[i], doc[j]] += 1.0 * axis[doc[k]]
             total += 1
       m3 += m3doc / total
     m3 /= len(documents)
+    return m3
+
+  def moment3_vectorized(self, n_words, docs, axis):
+    m3 = np.zeros( (n_words, n_words) )
+    nd = docs.shape[0]
+    ns = np.array([x.shape[0] for x in docs])
+    code = """
+for (int i = 0; i < nd; ++i) {
+  int len = ns(i);
+  double div = len * (len - 1) * (len - 2);
+  double count = 1.0/(div * nd);
+  for (int j = 0; j < len; ++j) {
+    for (int k = j+1; k < len; ++k) {
+      for (int l = k+1; l < len; ++l) {
+        int idx1 = docs(i,j);
+        int idx2 = docs(i,k);
+        int idx3 = docs(i,l);
+        m3(idx1,idx2) += axis(idx3)*count;
+        m3(idx1,idx3) += axis(idx2)*count;
+        m3(idx2,idx1) += axis(idx3)*count;
+        m3(idx2,idx3) += axis(idx1)*count;
+        m3(idx3,idx1) += axis(idx2)*count;
+        m3(idx3,idx2) += axis(idx1)*count;
+      }
+    }
+  }
+}
+    """
+    weave.inline(code,
+                 ["m3", "axis", "nd", "ns", "docs"],
+                 type_converters=converters.blitz,
+                 compiler="gcc")
     return m3
 
   def pairs(self, n_words, documents, m1=None, m2=None):
@@ -365,7 +428,7 @@ class SpectralLDA(object):
 
     return m2 - (alpha / (1 + alpha)) * np.outer(m1, m1)
 
-  def triples(self, n_words, documents, axis, m1=None, m2=None, m3=None):
+  def triples(self, n_words, documents, docs, axis, m1=None, m2=None, m3=None):
     alpha = self.doc_topic_prior
 
     if m1 is None:
@@ -375,7 +438,7 @@ class SpectralLDA(object):
       m2 = self.moment2(n_words, documents)
 
     if m3 is None:
-      m3 = self.moment3(n_words, documents, axis)
+      m3 = self.moment3_vectorized(n_words, docs, axis)
 
     return (
       m3
